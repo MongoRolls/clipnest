@@ -1,0 +1,798 @@
+import AppKit
+import Carbon
+import ImageIO
+import Darwin
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSMenuItemValidation, NSMenuDelegate {
+    private let worker = DispatchQueue(label: "com.clipnest.history")
+    private let clipboard: ClipboardAccess
+    private var store: HistoryStore?
+    private var entries: [Entry] = []
+    private var favorites: [Entry] = []
+    private var favoriteIDs = Set<String>()
+    private var showingFavorites = false
+    private var filtered: [Entry] = []
+    private let historySearch = HistorySearch()
+    private var resetSelectionOnResults = false
+    private var pendingKeys: [() -> Void] = []
+    private var presentationNumber = 0
+    private static let maxPollAttempts = 3
+    private var polledSequence: Int?
+    private var remainingPollAttempts = 0
+    private var capturing = false
+    private var busy = true
+    private var ready = false
+    private var quitting = false
+    private var timer: Timer?
+    private var hotKey: EventHotKeyRef?
+    private var eventHandler: EventHandlerRef?
+    private var hotKeyWarning: String?
+    private var keyboard = KeyboardSettings()
+    private let defaults: UserDefaults
+    private var lockFD: Int32 = -1
+    private var statusItem: NSStatusItem!
+    private var window: HistoryWindow!
+    private let search = NSSearchField()
+    private lazy var positionPicker = popupPosition.makePicker(target: self, action: #selector(changePosition(_:)))
+    private var popupPosition: PopupPosition
+    private var settingsController: SettingsWindowController?
+    private var presentationScreen: NSScreen?
+    private var presentationCursor: NSPoint?
+    private var presentationAboveCursor = false
+    private let table = HistoryTableView()
+    private static let favoriteDragType = NSPasteboard.PasteboardType("com.clipnest.favorite-id")
+    private let emptyText = NSTextField(wrappingLabelWithString: "")
+    private let thumbnails = NSCache<NSString, NSImage>()
+    private var failedThumbnails = Set<String>()
+    private let preview = NSPopover()
+    private var previewEntryID: String?
+    private let errorText = NSTextField(wrappingLabelWithString: "")
+    private let operation = NSTextField(labelWithString: "")
+    private var clearButton: NSButton!
+    private var listButton: NSButton!
+    private var plainTextMenuItem: NSMenuItem!
+    private var favoriteMenuItem: NSMenuItem!
+    private var deleteMenuItem: NSMenuItem!
+    private var previousApp: NSRunningApplication?
+    private let directory: URL
+
+    init(clipboard: ClipboardAccess = ClipboardAccess(), directory: URL = FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("ClipNest", isDirectory: true),
+         defaults: UserDefaults = .standard) {
+        self.clipboard = clipboard
+        self.directory = directory
+        self.defaults = defaults
+        popupPosition = .saved(in: defaults)
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            lockFD = open(directory.appendingPathComponent("instance.lock").path, O_CREAT | O_RDWR, 0o600)
+            guard lockFD >= 0 else { throw AppError("无法创建单实例锁（\(errno)）。") }
+            if flock(lockFD, LOCK_EX | LOCK_NB) != 0 {
+                guard errno == EWOULDBLOCK else { throw AppError("无法锁定应用实例（\(errno)）。") }
+                for app in NSRunningApplication.runningApplications(withBundleIdentifier: "com.clipnest.mac") where app.processIdentifier != getpid() {
+                    app.activate(options: [])
+                }
+                NSApp.terminate(nil)
+                return
+            }
+            createMenu()
+            startPanel { [directory] in
+                try HistoryStore(url: directory.appendingPathComponent("history.db"), key: HistoryStore.keychainKey())
+            }
+            do { try registerHotkey(keyboard.open) } catch {
+                report("注册快捷键", error)
+                hotKeyWarning = errorText.stringValue
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "ClipNest 无法启动"
+            alert.informativeText = error.localizedDescription
+            alert.runModal()
+            NSApp.terminate(nil)
+        }
+    }
+
+    func startPanel(openStore: @escaping () throws -> HistoryStore) {
+        createUI()
+        do { keyboard = try KeyboardSettings.saved(in: defaults) } catch { report("读取按键设置", error) }
+        updateKeyboardUI()
+        showWindow(nil)
+        worker.async { [self] in
+            do {
+                let store = try openStore()
+                let loaded = try store.load()
+                let saved = store.favorites
+                let warning = store.loadWarning
+                self.store = store
+                DispatchQueue.main.async {
+                    self.entries = loaded
+                    self.favorites = saved
+                    self.favoriteIDs = Set(saved.map(\.id))
+                    self.ready = true
+                    self.setBusy(false)
+                    if let warning { self.report("部分记录未加载", warning) }
+                    if self.window.isVisible { self.refresh() }
+                    self.timer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.capture() }
+                    self.capture()
+                }
+            } catch {
+                DispatchQueue.main.async { self.setBusy(false); self.report("加载历史和收藏，原始数据已保留", error) }
+            }
+        }
+    }
+
+    private func createMenu() {
+        let menu = NSMenu()
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "显示 ClipNest", action: #selector(showWindow(_:)), keyEquivalent: "")
+        appMenu.addItem(withTitle: "设置…", action: #selector(showSettings(_:)), keyEquivalent: ",").target = self
+        appMenu.addItem(withTitle: "退出 ClipNest", action: #selector(quit), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        menu.addItem(appItem)
+        let edit = NSMenuItem()
+        edit.title = "编辑"
+        let editMenu = NSMenu(title: "编辑")
+        for (title, action, key) in [("剪切", "cut:", "x"), ("复制", "copy:", "c"), ("粘贴", "paste:", "v"), ("全选", "selectAll:", "a")] {
+            editMenu.addItem(withTitle: title, action: Selector(action), keyEquivalent: key)
+        }
+        edit.submenu = editMenu
+        menu.addItem(edit)
+        NSApp.mainMenu = menu
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(statusClick(_:))
+        statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+    }
+    lazy var statusMenu: NSMenu = {
+        let menu = NSMenu()
+        menu.addItem(withTitle: "显示历史", action: #selector(showWindow(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "设置…", action: #selector(showSettings(_:)), keyEquivalent: ",")
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "退出 ClipNest", action: #selector(quit), keyEquivalent: "")
+        for item in menu.items where !item.isSeparatorItem { item.target = self }
+        return menu
+    }()
+
+    @objc private func statusClick(_ sender: Any?) {
+        if NSApp.currentEvent?.type == .rightMouseUp || NSApp.currentEvent?.modifierFlags.contains(.control) == true {
+            statusItem.menu = statusMenu
+            statusItem.button?.performClick(nil)
+            statusItem.menu = nil
+        } else { showWindow(sender) }
+    }
+
+    @objc private func showSettings(_ sender: Any?) {
+        preview.performClose(nil)
+        window.orderOut(nil)
+        if settingsController?.window?.isVisible != true {
+            let picker = popupPosition.makePicker(target: self, action: #selector(changePosition(_:)))
+            settingsController = SettingsWindowController(positionPicker: picker, keyboard: keyboard) { [unowned self] in
+                try self.applyKeyboard($0)
+            }
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        settingsController?.showWindow(sender)
+        settingsController?.window?.makeKeyAndOrderFront(sender)
+    }
+    private func createUI() {
+        window = HistoryWindow(contentRect: NSRect(x: 0, y: 0, width: HistoryLayout.width, height: HistoryLayout.height), styleMask: [.borderless, .resizable], backing: .buffered, defer: false)
+        window.title = "ClipNest"
+        window.minSize = NSSize(width: 360, height: 220)
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = true
+        window.acceptsMouseMovedEvents = true
+        window.hidesOnDeactivate = true
+        window.isMovableByWindowBackground = true
+        window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+        window.delegate = self
+        window.keyAction = { [weak self] event in self?.handleKey(event) ?? false }
+        let material = window.installSurface()
+        let root = NSStackView()
+        root.orientation = .vertical
+        root.alignment = .leading
+        root.spacing = 4
+        root.edgeInsets = NSEdgeInsets(top: 10, left: 8, bottom: 10, right: 8)
+        root.translatesAutoresizingMaskIntoConstraints = false
+        material.addSubview(root)
+        NSLayoutConstraint.activate([root.topAnchor.constraint(equalTo: material.topAnchor), root.bottomAnchor.constraint(equalTo: material.bottomAnchor), root.leadingAnchor.constraint(equalTo: material.leadingAnchor), root.trailingAnchor.constraint(equalTo: material.trailingAnchor)])
+        search.placeholderString = "搜索…"
+        search.font = .systemFont(ofSize: 14)
+        search.setAccessibilityLabel("搜索剪贴板历史")
+        search.delegate = self
+        search.sendsSearchStringImmediately = true
+        positionPicker.controlSize = .small
+        positionPicker.font = .systemFont(ofSize: 11)
+        positionPicker.toolTip = "选择窗口打开的位置"
+        positionPicker.setContentHuggingPriority(.required, for: .horizontal)
+        let heading = NSStackView(views: [search, positionPicker])
+        heading.spacing = 8
+        heading.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 4, right: 6)
+        heading.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        root.addArrangedSubview(heading)
+        errorText.textColor = .systemRed
+        errorText.font = .systemFont(ofSize: 11)
+        errorText.isSelectable = true
+        errorText.maximumNumberOfLines = 4
+        errorText.isHidden = true
+        root.addArrangedSubview(errorText)
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("entry"))
+        table.addTableColumn(column)
+        table.headerView = nil
+        table.backgroundColor = .clear
+        table.intercellSpacing = NSSize(width: 0, height: 0)
+        table.style = .plain
+        table.columnAutoresizingStyle = .lastColumnOnlyAutoresizingStyle
+        table.rowSizeStyle = .custom
+        table.delegate = self
+        table.dataSource = self
+        table.registerForDraggedTypes([Self.favoriteDragType])
+        table.setDraggingSourceOperationMask(.move, forLocal: true)
+        table.setDraggingSourceOperationMask([], forLocal: false)
+        table.verticalMotionCanBeginDrag = true
+        table.target = self
+        table.action = #selector(copyClickedRow)
+        // 菜单收起时指针可能落在另一行，查看预览期间保持用户选中的记录。
+        table.allowsHoverSelection = { [weak self] in self?.preview.isShown == false }
+        table.entryIDAtRow = { [weak self] row in
+            guard let self, !self.historySearch.isPending, self.filtered.indices.contains(row) else { return nil }
+            return self.filtered[row].id
+        }
+        table.setAccessibilityLabel("剪贴板历史记录")
+        let contextMenu = NSMenu()
+        contextMenu.delegate = self
+        for (title, action) in [("复制", #selector(copySelection)), ("复制为纯文本", #selector(copySelectionAsPlainText)), ("查看内容", #selector(showPreview)), ("收藏", #selector(toggleFavorite)), ("删除此条", #selector(deleteSelection))] {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+            item.target = self
+            contextMenu.addItem(item)
+            if action == #selector(copySelectionAsPlainText) {
+                plainTextMenuItem = item
+            }
+            if action == #selector(toggleFavorite) { favoriteMenuItem = item }
+            if action == #selector(deleteSelection) { deleteMenuItem = item }
+        }
+        table.menu = contextMenu
+        let list = NSScrollView()
+        list.documentView = table
+        list.hasVerticalScroller = true
+        list.hasHorizontalScroller = false
+        list.scrollerStyle = .overlay
+        list.horizontalScrollElasticity = .none
+        list.autohidesScrollers = true
+        list.drawsBackground = false
+        list.borderType = .noBorder
+        let listContainer = NSView()
+        list.translatesAutoresizingMaskIntoConstraints = false
+        emptyText.translatesAutoresizingMaskIntoConstraints = false
+        emptyText.textColor = .secondaryLabelColor
+        emptyText.font = .systemFont(ofSize: 13)
+        emptyText.alignment = .center
+        listContainer.addSubview(list)
+        listContainer.addSubview(emptyText)
+        NSLayoutConstraint.activate([
+            list.leadingAnchor.constraint(equalTo: listContainer.leadingAnchor),
+            list.trailingAnchor.constraint(equalTo: listContainer.trailingAnchor),
+            list.topAnchor.constraint(equalTo: listContainer.topAnchor),
+            list.bottomAnchor.constraint(equalTo: listContainer.bottomAnchor),
+            listContainer.heightAnchor.constraint(greaterThanOrEqualToConstant: 64),
+            emptyText.centerYAnchor.constraint(equalTo: listContainer.centerYAnchor),
+            emptyText.leadingAnchor.constraint(equalTo: listContainer.leadingAnchor, constant: 20),
+            emptyText.trailingAnchor.constraint(equalTo: listContainer.trailingAnchor, constant: -20)
+        ])
+        root.addArrangedSubview(listContainer)
+        operation.font = .systemFont(ofSize: 11)
+        operation.textColor = .secondaryLabelColor
+        root.addArrangedSubview(operation)
+        let separator = NSBox()
+        separator.boxType = .separator
+        root.addArrangedSubview(separator)
+        listButton = FooterButton(title: "查看收藏", target: self, action: #selector(switchList))
+        clearButton = FooterButton(title: "清空历史", shortcut: "⌥⌘⌫", target: self, action: #selector(clearHistory))
+        let quitButton = FooterButton(title: "退出", shortcut: "⌘ Q", target: self, action: #selector(quit))
+        root.addArrangedSubview(listButton)
+        root.addArrangedSubview(clearButton)
+        root.addArrangedSubview(quitButton)
+        // 每一行明确填满面板，避免按按钮的固有宽度收缩。
+        for view in root.arrangedSubviews {
+            view.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -16).isActive = true
+        }
+        thumbnails.countLimit = Limits.history
+        preview.behavior = .transient
+        setBusy(true)
+    }
+
+    @objc func showWindow(_ sender: Any?) {
+        presentationNumber += 1
+        pendingKeys.removeAll()
+        if let app = NSWorkspace.shared.frontmostApplication, app.processIdentifier != getpid() { previousApp = app }
+        if !window.isVisible {
+            showingFavorites = false
+            search.stringValue = ""
+            refresh(resetSelection: true)
+            positionWindow()
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(search)
+        search.selectText(nil)
+    }
+    private func positionWindow() {
+        let mouse = NSEvent.mouseLocation
+        let button = statusItem?.button
+        let statusFrame = button.flatMap { button in
+            button.window?.convertToScreen(button.convert(button.bounds, to: nil))
+        }
+        let screen = popupPosition == .statusItem && statusFrame != nil
+            ? button?.window?.screen
+            : NSScreen.screens.first { $0.frame.contains(mouse) } ?? NSScreen.main
+        guard let visible = screen?.visibleFrame else { return }
+        presentationScreen = screen
+        presentationCursor = nil
+        resizeToFitHistory(on: screen)
+        let frame = popupPosition.frame(size: window.frame.size, visibleFrame: visible, cursor: mouse, statusFrame: statusFrame)
+        window.setFrame(frame, display: true)
+        if popupPosition == .cursor || (popupPosition == .statusItem && statusFrame == nil) {
+            presentationCursor = mouse
+            presentationAboveCursor = frame.minY > mouse.y
+        }
+    }
+    func windowWillMove(_ notification: Notification) {
+        // 手动拖动后，以用户放置的位置为准。
+        presentationCursor = nil
+        presentationScreen = nil
+    }
+    @objc private func changePosition(_ sender: NSPopUpButton) {
+        guard let rawValue = sender.selectedItem?.representedObject as? String,
+              let position = PopupPosition(rawValue: rawValue) else { return }
+        popupPosition = position
+        defaults.set(position.rawValue, forKey: PopupPosition.preferenceKey)
+        positionPicker.selectItem(withTitle: position.title)
+        settingsController?.positionPicker.selectItem(withTitle: position.title)
+        guard window.isVisible else { return }
+        preview.performClose(nil)
+        positionWindow()
+        window.makeFirstResponder(search)
+    }
+    func windowShouldClose(_ sender: NSWindow) -> Bool { sender.orderOut(nil); return false }
+    func windowDidResignKey(_ notification: Notification) { pendingKeys.removeAll() }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showWindow(nil); return true }
+    private func handleKey(_ event: NSEvent) -> Bool {
+        let modifiers = event.modifierFlags.intersection(HistoryShortcut.modifiers)
+        if let index = keyboard.number.index(characters: event.charactersIgnoringModifiers, flags: event.modifierFlags) {
+            withCurrentResults { [self] in
+                guard filtered.indices.contains(index) else { return }
+                table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+                copySelection()
+            }
+            return true
+        }
+        if modifiers == .command {
+            if event.charactersIgnoringModifiers == "f" { window.makeFirstResponder(search); search.selectText(nil); return true }
+            if event.charactersIgnoringModifiers == "i" { withCurrentResults(showPreview); return true }
+            if event.keyCode == 51 { deleteSelection(); return true }
+        }
+        if modifiers == [.command, .option], event.keyCode == 51 { clearHistory(); return true }
+        if event.keyCode == 53 {
+            pendingKeys.removeAll()
+            if preview.isShown { preview.performClose(nil) } else { window.orderOut(nil) }
+            return true
+        }
+        if event.keyCode == 125 || event.keyCode == 126 {
+            let offset = event.keyCode == 125 ? 1 : -1
+            withCurrentResults { [self] in
+                guard !filtered.isEmpty else { return }
+                let next = max(0, min(filtered.count - 1, table.selectedRow + offset))
+                table.selectRowIndexes(IndexSet(integer: next), byExtendingSelection: false)
+                table.scrollRowToVisible(next)
+            }
+            return true
+        }
+        if keyboard.confirm.matches(event) {
+            withCurrentResults(modifiers.contains(.shift) ? copySelectionAsPlainText : copySelection)
+            return true
+        }
+        return false
+    }
+    private func withCurrentResults(_ action: @escaping () -> Void) {
+        if historySearch.isPending { pendingKeys.append(action) } else { action() }
+    }
+    func controlTextDidChange(_ obj: Notification) { refresh(resetSelection: true) }
+    func numberOfRows(in tableView: NSTableView) -> Int { filtered.count }
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let entry = filtered[row]
+        let cell = tableView.makeView(withIdentifier: HistoryCell.reuseIdentifier, owner: self) as? HistoryCell ?? HistoryCell(frame: .zero)
+        cell.configure(entry: entry, row: row, image: thumbnail(for: entry), isFavorite: favoriteIDs.contains(entry.id), numberShortcut: keyboard.number)
+        return cell
+    }
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        filtered[row].payload.kind == .image ? HistoryLayout.imageRowHeight : HistoryLayout.textRowHeight
+    }
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { HistoryRowView() }
+    private var canReorderFavorites: Bool {
+        showingFavorites && ready && !busy && !quitting && !historySearch.isPending
+    }
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        guard canReorderFavorites, filtered.indices.contains(row) else { return nil }
+        let item = NSPasteboardItem()
+        guard item.setString(filtered[row].id, forType: Self.favoriteDragType) else { return nil }
+        return item
+    }
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession,
+                   willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
+        table.draggedSinceMouseDown = true
+    }
+    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo,
+                   proposedRow row: Int, proposedDropOperation operation: NSTableView.DropOperation) -> NSDragOperation {
+        guard canReorderFavorites, (info.draggingSource as? NSTableView) === tableView,
+              (0...filtered.count).contains(row) else { return [] }
+        tableView.setDropRow(row, dropOperation: .above)
+        return .move
+    }
+    func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo,
+                   row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
+        guard canReorderFavorites, (info.draggingSource as? NSTableView) === tableView,
+              dropOperation == .above, (0...filtered.count).contains(row),
+              let id = info.draggingPasteboard.string(forType: Self.favoriteDragType),
+              let source = filtered.firstIndex(where: { $0.id == id }) else { return false }
+        if row == source || row == source + 1 { return true }
+        // 搜索结果可能只包含部分收藏，以可见的相邻记录确定它在完整列表中的位置。
+        let atEnd = row == filtered.count
+        let neighbor = filtered[atEnd ? row - 1 : row].id
+        perform("调整收藏顺序") {
+            try self.store!.moveFavorite(id, relativeTo: neighbor, insertAfter: atEnd)
+        }
+        return true
+    }
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        if preview.isShown && previewEntryID != selected?.id { preview.performClose(nil) }
+    }
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if [#selector(copySelection), #selector(copySelectionAsPlainText), #selector(deleteSelection), #selector(showPreview), #selector(toggleFavorite)].contains(menuItem.action) {
+            return ready && !busy && !historySearch.isPending && selected != nil
+        }
+        return true
+    }
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === table.menu else { return }
+        plainTextMenuItem.isHidden = selected?.payload.kind != .text
+        favoriteMenuItem.title = selected.map { favoriteIDs.contains($0.id) } == true ? "取消收藏" : "收藏"
+        deleteMenuItem.isHidden = showingFavorites
+    }
+    private var selected: Entry? { filtered.indices.contains(table.selectedRow) ? filtered[table.selectedRow] : nil }
+    private func refresh(resetSelection: Bool = false) {
+        if resetSelection {
+            pendingKeys.removeAll()
+            resetSelectionOnResults = true
+        }
+        historySearch.filter(showingFavorites ? favorites : entries, query: search.stringValue) { [weak self] in
+            self?.applyResults($0)
+        }
+        table.isEnabled = !historySearch.isPending
+        if historySearch.isPending && filtered.isEmpty { emptyText.stringValue = "正在搜索…" }
+    }
+    private func applyResults(_ results: [Entry]) {
+        let reset = resetSelectionOnResults
+        resetSelectionOnResults = false
+        let selectedID = reset ? nil : selected?.id
+        let oldIndex = reset ? 0 : table.selectedRow
+        let anchor = reset ? nil : table.scrollAnchor()
+        filtered = results
+        table.isEnabled = true
+        table.reloadData()
+        if !filtered.isEmpty {
+            let index = selectedID.flatMap { id in filtered.firstIndex { $0.id == id } } ?? max(0, min(oldIndex, filtered.count - 1))
+            table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+            if reset || selectedID != filtered[index].id {
+                table.scrollRowToVisible(index)
+            } else if let anchor, let row = filtered.firstIndex(where: { $0.id == anchor.id }) {
+                table.scroll(NSPoint(x: table.visibleRect.minX, y: table.rect(ofRow: row).minY + anchor.offset))
+            }
+        }
+        table.setAccessibilityValue("\(filtered.count) 条\(showingFavorites ? "收藏" : "历史")记录")
+        updateControls()
+        resizeToFitHistory()
+        let actions = pendingKeys
+        pendingKeys.removeAll()
+        for action in actions where window.isKeyWindow && !busy { action() }
+    }
+    private func resizeToFitHistory(on targetScreen: NSScreen? = nil) {
+        let screen = (targetScreen ?? (window.isVisible ? window.screen : presentationScreen))?.visibleFrame ?? NSScreen.main?.visibleFrame
+        let maximum = min(HistoryLayout.height, (screen?.height ?? HistoryLayout.height) - 16)
+        var contentHeight: CGFloat = 156 + (errorText.isHidden ? 0 : 60)
+        for entry in filtered {
+            if contentHeight >= maximum { break }
+            contentHeight += entry.payload.kind == .image ? HistoryLayout.imageRowHeight : HistoryLayout.textRowHeight
+        }
+        let height = min(maximum, max(220, contentHeight))
+        if popupPosition == .center, let visible = presentationScreen?.visibleFrame {
+            let size = NSSize(width: window.frame.width, height: height)
+            let frame = PopupPosition.center.frame(size: size, visibleFrame: visible, cursor: .zero, statusFrame: nil)
+            if frame != window.frame { window.setFrame(frame, display: true) }
+            return
+        }
+        if let cursor = presentationCursor, let screen {
+            let size = NSSize(width: window.frame.width, height: height)
+            let frame = PopupPosition.cursor.frame(size: size, visibleFrame: screen, cursor: cursor, statusFrame: nil, aboveCursor: presentationAboveCursor)
+            if frame != window.frame { window.setFrame(frame, display: true) }
+            return
+        }
+        var frame = window.frame
+        frame.origin.y += (frame.height - height) * (popupPosition == .center ? 0.5 : 1)
+        frame.size.height = height
+        if let screen {
+            frame.origin.y = max(screen.minY + HistoryLayout.screenMargin, min(frame.origin.y, screen.maxY - height - HistoryLayout.screenMargin))
+        }
+        if frame != window.frame { window.setFrame(frame, display: true) }
+    }
+    private func thumbnail(for entry: Entry) -> NSImage? {
+        guard let png = entry.payload.png else { return nil }
+        if let cached = thumbnails.object(forKey: entry.id as NSString) { return cached }
+        guard !failedThumbnails.contains(entry.id) else { return nil }
+        guard let source = CGImageSourceCreateWithData(png as CFData, nil),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: 640] as CFDictionary) else {
+            failedThumbnails.insert(entry.id)
+            DispatchQueue.main.async { self.report("显示图片", AppError("无法解码该图片的缩略图，原始记录已保留。")) }
+            return nil
+        }
+        let result = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+        thumbnails.setObject(result, forKey: entry.id as NSString)
+        return result
+    }
+    private func updateControls() {
+        emptyText.isHidden = !filtered.isEmpty
+        emptyText.stringValue = !ready ? (busy ? "正在加载历史…" : "历史加载失败，请查看错误提示。") :
+            ((showingFavorites ? favorites : entries).isEmpty ?
+                (showingFavorites ? "在历史记录中右键收藏内容，常用内容将显示在这里。" : "还没有复制记录。试试复制一段文字或一张图片。") : "没有匹配的记录。")
+        search.placeholderString = showingFavorites ? "搜索收藏…" : "搜索…"
+        search.setAccessibilityLabel(showingFavorites ? "搜索收藏记录" : "搜索剪贴板历史")
+        table.setAccessibilityLabel(showingFavorites ? "收藏记录" : "剪贴板历史记录")
+        listButton.title = showingFavorites ? "返回历史" : "查看收藏"
+        listButton.isEnabled = ready && !busy
+        clearButton.isEnabled = ready && !busy && !entries.isEmpty
+    }
+    private func setBusy(_ value: Bool) {
+        busy = value
+        operation.stringValue = value ? "正在处理…" : ""
+        operation.isHidden = !value
+        updateControls()
+    }
+    private func perform(_ label: String, action: @escaping () throws -> Void, completion: (() -> Void)? = nil) {
+        guard ready, !busy, !quitting else { return }
+        setBusy(true)
+        worker.async {
+            let result = Result { try action() }
+            let loaded = self.store!.entries
+            let saved = self.store!.favorites
+            DispatchQueue.main.async {
+                self.entries = loaded
+                self.favorites = saved
+                self.favoriteIDs = Set(saved.map(\.id))
+                self.setBusy(false)
+                switch result {
+                case .success: completion?()
+                case .failure(let error): self.report(label, error)
+                }
+                if self.window.isVisible { self.refresh() }
+            }
+        }
+    }
+    private func capture() {
+        guard ready, !busy, !capturing, !quitting else { return }
+        let current = clipboard.pasteboard.changeCount
+        if polledSequence != current {
+            polledSequence = current
+            remainingPollAttempts = Self.maxPollAttempts
+        }
+        guard remainingPollAttempts > 0 else { return }
+        let firstAttempt = remainingPollAttempts == Self.maxPollAttempts
+        remainingPollAttempts -= 1
+        capturing = true
+        worker.async { [self] in
+            do {
+                let saved = try clipboard.capture(in: store!)
+                let handled = clipboard.handledSequence
+                let loaded = store!.entries
+                DispatchQueue.main.async {
+                    self.capturing = false
+                    self.polledSequence = handled
+                    self.remainingPollAttempts = 0
+                    guard saved else { return }
+                    self.entries = loaded
+                    if self.window.isVisible {
+                        if self.showingFavorites { self.updateControls() } else { self.refresh() }
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.capturing = false
+                    if firstAttempt { self.report("记录剪贴板", error) }
+                }
+            }
+        }
+    }
+    @objc private func copySelection() {
+        guard !historySearch.isPending, let entry = selected else { return }
+        copy(entry)
+    }
+    @objc private func copySelectionAsPlainText() {
+        guard !historySearch.isPending, let entry = selected, entry.payload.kind == .text else { return }
+        copy(entry, asPlainText: true)
+    }
+    private func copy(_ entry: Entry, asPlainText: Bool = false) {
+        let presentation = presentationNumber
+        perform("复制记录", action: {
+            let payload = asPlainText ? Payload(kind: .text, text: entry.payload.text) : entry.payload
+            try self.clipboard.write(payload, preservingChangesIn: self.store!)
+            do { try self.store!.recordUse(of: entry) }
+            catch { throw AppError("内容已复制，但更新历史失败：\(error.localizedDescription)") }
+        }, completion: {
+            guard self.presentationNumber == presentation, self.window.isVisible, NSApp.isActive else { return }
+            self.preview.performClose(nil)
+            self.window.orderOut(nil)
+            self.previousApp?.activate(options: [])
+        })
+    }
+    @objc private func copyClickedRow() {
+        let row = table.clickedRow
+        guard !historySearch.isPending, filtered.indices.contains(row), table.clickMatchesEntry else { return }
+        copy(filtered[row])
+    }
+    @objc private func showPreview() {
+        guard ready, !busy, !historySearch.isPending, let entry = selected else { return }
+        if preview.isShown && previewEntryID == entry.id { return }
+        preview.performClose(nil)
+        previewEntryID = entry.id
+        preview.contentViewController = ContentPreviewController(entry: entry, image: thumbnail(for: entry))
+        table.scrollRowToVisible(table.selectedRow)
+        preview.show(relativeTo: table.rect(ofRow: table.selectedRow), of: table, preferredEdge: .maxX)
+    }
+    @objc private func switchList() {
+        guard ready, !busy else { return }
+        showingFavorites.toggle()
+        preview.performClose(nil)
+        search.stringValue = ""
+        refresh(resetSelection: true)
+        window.makeFirstResponder(search)
+    }
+    @objc private func toggleFavorite() {
+        guard !historySearch.isPending, let entry = selected else { return }
+        if favoriteIDs.contains(entry.id) {
+            perform("取消收藏") { try self.store!.removeFavorite(entry.id) }
+        } else {
+            perform("收藏记录") { try self.store!.addFavorite(entry.id) }
+        }
+    }
+    @objc private func deleteSelection() {
+        guard !historySearch.isPending, let entry = selected else { return }
+        if showingFavorites {
+            perform("取消收藏") { try self.store!.removeFavorite(entry.id) }
+        } else {
+            perform("删除记录") { try self.store!.delete(entry.id) }
+        }
+    }
+    @objc private func clearHistory() {
+        guard ready, !busy, !entries.isEmpty else { return }
+        let alert = NSAlert()
+        alert.messageText = "清空全部历史？"
+        alert.informativeText = "收藏内容和系统当前剪贴板内容会保留。"
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "清空历史")
+        guard alert.runModal() == .alertSecondButtonReturn else { return }
+        let current = clipboard.pasteboard.changeCount
+        perform("清空历史") {
+            try self.store!.clear()
+            self.clipboard.handledSequence = current
+        }
+    }
+    private func report(_ action: String, _ error: Error) {
+        let message = "\(action)：\(error.localizedDescription)"
+        errorText.stringValue = message
+        errorText.isHidden = false
+        resizeToFitHistory()
+        statusItem?.button?.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: "ClipNest 发生错误")
+        statusItem?.button?.toolTip = message
+        do {
+            let url = directory.appendingPathComponent("errors.log")
+            if FileManager.default.fileExists(atPath: url.path) {
+                let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+                if (attrs[.size] as? Int ?? 0) > 1024 * 1024 {
+                    let old = directory.appendingPathComponent("errors.previous.log")
+                    if FileManager.default.fileExists(atPath: old.path) { try FileManager.default.removeItem(at: old) }
+                    try FileManager.default.moveItem(at: url, to: old)
+                }
+            }
+            if !FileManager.default.fileExists(atPath: url.path) { try Data().write(to: url) }
+            let handle = try FileHandle(forWritingTo: url)
+            defer {
+                do { try handle.close() }
+                catch { errorText.stringValue += "\n关闭错误日志失败：\(error.localizedDescription)" }
+            }
+            try handle.seekToEnd()
+            // 只记录操作及错误类型和代码，避免文件路径或正文进入日志。
+            let nsError = error as NSError
+            try handle.write(contentsOf: Data("\(Date()) \(action) \(nsError.domain) \(nsError.code)\n".utf8))
+        } catch { errorText.stringValue += "\n错误日志写入失败：\(error.localizedDescription)" }
+    }
+    private func updateKeyboardUI() {
+        plainTextMenuItem.keyEquivalent = keyboard.confirm.keyEquivalent
+        plainTextMenuItem.keyEquivalentModifierMask = keyboard.confirm.flags.union(.shift)
+        if errorText.isHidden {
+            statusItem?.button?.image = NSImage(systemSymbolName: "clipboard", accessibilityDescription: "ClipNest 剪贴板历史")
+            statusItem?.button?.toolTip = "ClipNest · \(keyboard.open.title)"
+        }
+    }
+
+    private func applyKeyboard(_ settings: KeyboardSettings) throws {
+        try settings.validate()
+        let data = try PropertyListEncoder().encode(settings)
+        try registerHotkey(settings.open)
+        keyboard = settings
+        defaults.set(data, forKey: KeyboardSettings.preferenceKey)
+        if errorText.stringValue == hotKeyWarning {
+            errorText.stringValue = ""
+            errorText.isHidden = true
+        }
+        hotKeyWarning = nil
+        pendingKeys.removeAll()
+        updateKeyboardUI()
+        table.reloadData()
+    }
+
+    private func registerHotkey(_ shortcut: OpenShortcut) throws {
+        if hotKey != nil && shortcut == keyboard.open { return }
+        if eventHandler == nil {
+            var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            let context = Unmanaged.passUnretained(self).toOpaque()
+            let installed = InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
+                guard let userData, let event else { return OSStatus(eventNotHandledErr) }
+                let delegate = Unmanaged<AppDelegate>.fromOpaque(userData).takeUnretainedValue()
+                var id = EventHotKeyID()
+                let status = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                    nil, MemoryLayout<EventHotKeyID>.size, nil, &id)
+                guard status == noErr, id.signature == 0x434E5354, id.id == delegate.keyboard.open.eventID else {
+                    return OSStatus(eventNotHandledErr)
+                }
+                delegate.showWindow(nil)
+                return noErr
+            }, 1, &spec, context, &eventHandler)
+            guard installed == noErr else { throw AppError("安装快捷键事件失败（\(installed)）。") }
+        }
+        // 新组合注册成功后才释放旧组合，修改失败时原快捷键仍然可用。
+        var replacement: EventHotKeyRef?
+        let status = RegisterEventHotKey(UInt32(shortcut.code), UInt32(shortcut.modifiers),
+            EventHotKeyID(signature: 0x434E5354, id: shortcut.eventID), GetApplicationEventTarget(),
+            OptionBits(kEventHotKeyExclusive), &replacement)
+        guard status == noErr, let replacement else {
+            throw AppError("\(shortcut.title) 注册失败，可能已被占用（\(status)）。请在设置中选择其他组合。")
+        }
+        if let hotKey {
+            let result = UnregisterEventHotKey(hotKey)
+            if result != noErr {
+                let cleanup = UnregisterEventHotKey(replacement)
+                throw AppError("释放原快捷键失败（\(result)），撤销新快捷键注册的状态码为 \(cleanup)。")
+            }
+        }
+        hotKey = replacement
+    }
+    @objc private func quit() { NSApp.terminate(nil) }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if quitting { return .terminateLater }
+        quitting = true
+        historySearch.cancel()
+        pendingKeys.removeAll()
+        timer?.invalidate()
+        worker.async { DispatchQueue.main.async { sender.reply(toApplicationShouldTerminate: true) } }
+        return .terminateLater
+    }
+    func applicationWillTerminate(_ notification: Notification) {
+        if let hotKey { UnregisterEventHotKey(hotKey) }
+        if let eventHandler { RemoveEventHandler(eventHandler) }
+        if lockFD >= 0 { close(lockFD) }
+    }
+}

@@ -1,0 +1,152 @@
+import AppKit
+import CryptoKit
+import ImageIO
+
+enum Limits {
+    static let history = 50
+    static let recordSizeMiB = 64
+    static let bytes = recordSizeMiB * 1024 * 1024
+    static let pixels = 32_000_000
+    static let origin = NSPasteboard.PasteboardType("com.clipnest.origin")
+}
+
+enum HistoryShortcut: String, CaseIterable, Codable {
+    case fn, command, option, control
+
+    var flag: NSEvent.ModifierFlags {
+        switch self {
+        case .fn: return .function
+        case .command: return .command
+        case .option: return .option
+        case .control: return .control
+        }
+    }
+    var title: String {
+        switch self {
+        case .fn: return "fn"
+        case .command: return "⌘"
+        case .option: return "⌥"
+        case .control: return "⌃"
+        }
+    }
+    static let modifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift, .function]
+    static let numbers = 1...9
+
+    func index(characters: String?, flags: NSEvent.ModifierFlags) -> Int? {
+        guard flags.intersection(Self.modifiers) == flag,
+              let characters, characters.count == 1,
+              let number = Int(characters), Self.numbers.contains(number) else { return nil }
+        return number - 1
+    }
+
+    func label(for index: Int) -> String {
+        Self.numbers.contains(index + 1) ? "\(title) \(index + 1)" : ""
+    }
+}
+
+struct AppError: LocalizedError {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var errorDescription: String? { message }
+}
+
+struct Payload: Codable {
+    enum Kind: String, Codable { case text, image, files }
+    let kind: Kind
+    var text: String? = nil
+    var html: Data? = nil
+    var rtf: Data? = nil
+    var png: Data? = nil
+    var files: [String]? = nil
+    var width: Int = 0
+    var height: Int = 0
+
+    func validate() throws {
+        let valid: Bool
+        switch kind {
+        case .text:
+            valid = !(text ?? "").isEmpty && png == nil && files == nil && width == 0 && height == 0
+        case .image:
+            valid = png?.isEmpty == false && text == nil && html == nil && rtf == nil && files == nil
+                && width > 0 && height > 0 && width <= Limits.pixels / height
+            if valid, let png {
+                let size = try Self.imageSize(png)
+                guard size.0 == width && size.1 == height else { throw AppError("图片尺寸校验失败。") }
+            }
+        case .files:
+            valid = files?.isEmpty == false && files!.allSatisfy { $0.hasPrefix("/") }
+                && text == nil && html == nil && rtf == nil && png == nil && width == 0 && height == 0
+        }
+        guard valid else { throw AppError("剪贴板记录格式无效。") }
+    }
+
+    func encoded() throws -> Data {
+        try validate()
+        let rawSize = (text?.utf8.count ?? 0) + (html?.count ?? 0) + (rtf?.count ?? 0)
+            + (png?.count ?? 0) + (files?.reduce(0) { $0 + $1.utf8.count } ?? 0)
+        guard rawSize <= Limits.bytes else { throw AppError("该记录超过 \(Limits.recordSizeMiB) MiB，未保存到历史。") }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let data = try encoder.encode(self)
+        guard data.count <= Limits.bytes else { throw AppError("该记录编码后超过 \(Limits.recordSizeMiB) MiB，未保存到历史。") }
+        return data
+    }
+
+    static func imageSize(_ data: Data) throws -> (Int, Int) {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? Int,
+              let height = properties[kCGImagePropertyPixelHeight] as? Int,
+              width > 0, height > 0, width <= Limits.pixels / height
+        else { throw AppError("图片无法读取或超过 3200 万像素。") }
+        return (width, height)
+    }
+
+    var searchText: String {
+        switch kind {
+        case .text: return text!
+        case .image: return "图片 image png \(width)×\(height)"
+        case .files: return files!.joined(separator: "\n")
+        }
+    }
+    var label: String {
+        switch kind { case .text: return "文本"; case .image: return "图片"; case .files: return "文件" }
+    }
+    var preview: String {
+        if kind == .text, text!.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "空白文本 · \(text!.count) 个字符"
+        }
+        let value = kind == .files ? files!.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: "、") : searchText
+        let shortened = value.prefix(181).count > 180 ? String(value.prefix(90)) + "…" + String(value.suffix(90)) : value
+        return shortened.replacingOccurrences(of: "\r", with: " ")
+            .replacingOccurrences(of: "\n", with: " ").replacingOccurrences(of: "\t", with: " ")
+    }
+    var detail: String {
+        let value = searchText
+        let end = value.index(value.startIndex, offsetBy: 12_000, limitedBy: value.endIndex) ?? value.endIndex
+        return String(value[..<end]) + (end != value.endIndex ? "\n\n预览已截断，复制保留完整内容。" : "")
+    }
+    func matches(terms: [String]) -> Bool {
+        terms.allSatisfy { term in
+            if kind == .files {
+                return files!.contains { $0.range(of: term, options: [.caseInsensitive]) != nil }
+            }
+            return searchText.range(of: term, options: [.caseInsensitive]) != nil
+        }
+    }
+}
+
+struct Entry {
+    let id: String
+    var date: Date
+    let payload: Payload
+    let preview: String
+
+    init(id: String, date: Date, payload: Payload) {
+        self.id = id
+        self.date = date
+        self.payload = payload
+        // 记录在后台加载或保存时计算，列表滚动不再重复遍历正文。
+        self.preview = payload.preview
+    }
+}

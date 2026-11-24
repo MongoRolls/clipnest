@@ -1,0 +1,42 @@
+import Foundation
+
+// 由主线程提交快照和接收结果。后台同时只匹配一份快照。
+final class HistorySearch {
+    private let queue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "com.clipnest.search"
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .userInitiated
+        return queue
+    }()
+    private var pending: BlockOperation?
+    var isPending: Bool { pending != nil }
+
+    func cancel() {
+        pending?.cancel()
+        pending = nil
+    }
+
+    func filter(_ entries: [Entry], query: String, apply: @escaping ([Entry]) -> Void) {
+        cancel()
+        let terms = query.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        guard !terms.isEmpty, !entries.isEmpty else { apply(entries); return }
+
+        let operation = BlockOperation()
+        pending = operation
+        operation.addExecutionBlock { [weak self, weak operation] in
+            guard let operation else { return }
+            var matches: [Entry] = []
+            for entry in entries {
+                guard !operation.isCancelled else { return }
+                if entry.payload.matches(terms: terms) { matches.append(entry) }
+            }
+            DispatchQueue.main.async { [weak self, matches] in
+                guard let self, self.pending === operation else { return }
+                self.pending = nil
+                apply(matches)
+            }
+        }
+        queue.addOperation(operation)
+    }
+}

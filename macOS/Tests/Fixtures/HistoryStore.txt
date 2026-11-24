@@ -1,0 +1,248 @@
+import Foundation
+import CryptoKit
+import Security
+import SQLite3
+
+final class HistoryStore {
+    private(set) var entries: [Entry] = []
+    private(set) var favorites: [Entry] = []
+    private(set) var loadWarning: AppError?
+    private var db: OpaquePointer?
+    private let key: SymmetricKey
+    private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+    static func keychainKey(service: String = "com.clipnest.history") throws -> SymmetricKey {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service, kSecAttrAccount as String: "history-key"]
+        var result: CFTypeRef?
+        let status = SecItemCopyMatching(query.merging([kSecReturnData as String: true]) { _, new in new } as CFDictionary, &result)
+        if status == errSecSuccess {
+            guard let data = result as? Data, data.count == 32 else { throw AppError("钥匙串密钥格式无效。") }
+            return SymmetricKey(data: data)
+        }
+        guard status == errSecItemNotFound else { throw AppError("读取钥匙串失败（\(status)）。") }
+        let key = SymmetricKey(size: .bits256)
+        let data = key.withUnsafeBytes { Data($0) }
+        let add = SecItemAdd(query.merging([kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly]) { _, new in new } as CFDictionary, nil)
+        guard add == errSecSuccess else { throw AppError("保存钥匙串密钥失败（\(add)）。") }
+        return key
+    }
+
+    init(url: URL, key: SymmetricKey) throws {
+        self.key = key
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK else {
+            let error = failure("打开数据库")
+            sqlite3_close(db)
+            db = nil
+            throw error
+        }
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        try execute("PRAGMA secure_delete=ON; PRAGMA busy_timeout=3000; CREATE TABLE IF NOT EXISTS history(id TEXT PRIMARY KEY, copied_at REAL NOT NULL, position INTEGER NOT NULL, payload BLOB NOT NULL); CREATE TABLE IF NOT EXISTS favorites(id TEXT PRIMARY KEY, copied_at REAL NOT NULL, position INTEGER NOT NULL, payload BLOB NOT NULL);")
+    }
+    deinit { sqlite3_close(db) }
+    private func failure(_ operation: String) -> AppError {
+        AppError("\(operation)失败：\(db.map { String(cString: sqlite3_errmsg($0)) } ?? "数据库未打开")（\(sqlite3_errcode(db))）。")
+    }
+    private func execute(_ sql: String) throws {
+        guard sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK else { throw failure("数据库操作") }
+    }
+    private func statement(_ sql: String) throws -> OpaquePointer {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { throw failure("准备数据库操作") }
+        return stmt
+    }
+    private func bind(_ value: String, to stmt: OpaquePointer, at index: Int32) throws {
+        guard sqlite3_bind_text(stmt, index, value, -1, transient) == SQLITE_OK else { throw failure("绑定参数") }
+    }
+    private func finish(_ stmt: OpaquePointer) throws {
+        guard sqlite3_step(stmt) == SQLITE_DONE else { throw failure("写入数据库") }
+    }
+    private func transaction<T>(_ body: () throws -> T) throws -> T {
+        try execute("BEGIN")
+        do {
+            let result = try body()
+            try execute("COMMIT")
+            return result
+        } catch {
+            let original = error
+            do { try execute("ROLLBACK") } catch { throw AppError("\(original.localizedDescription)；回滚失败：\(error.localizedDescription)") }
+            throw original
+        }
+    }
+    private struct LoadedRows {
+        var entries: [Entry] = []
+        var damaged: [Int64] = []
+        var firstError: Error?
+    }
+    func load() throws -> [Entry] {
+        let (history, saved, warning) = try transaction { () -> (LoadedRows, LoadedRows, AppError?) in
+            let history = try readEntries(from: "history", name: "历史", limit: Limits.history)
+            let saved = try readEntries(from: "favorites", name: "收藏")
+            guard let reason = history.firstError ?? saved.firstError else { return (history, saved, nil) }
+            guard !history.entries.isEmpty || !saved.entries.isEmpty else {
+                throw AppError("所有记录均未通过校验，请检查密钥或数据库。\(reason.localizedDescription)")
+            }
+            // 原字段按原值保存。之后淘汰旧历史或再次复制同一内容都不会覆盖损坏样本。
+            try execute("CREATE TABLE IF NOT EXISTS damaged_records(source TEXT NOT NULL, original_rowid INTEGER NOT NULL, id, copied_at, position, payload)")
+            try archive(history.damaged, from: "history")
+            try archive(saved.damaged, from: "favorites")
+            let warning = AppError("已保留 \(history.damaged.count) 条异常历史和 \(saved.damaged.count) 条异常收藏的原始数据。\(reason.localizedDescription)")
+            return (history, saved, warning)
+        }
+        entries = history.entries
+        favorites = saved.entries
+        loadWarning = warning
+        return entries
+    }
+    private func archive(_ rowIDs: [Int64], from table: String) throws {
+        for rowID in rowIDs {
+            try execute("""
+                INSERT INTO damaged_records(source, original_rowid, id, copied_at, position, payload)
+                SELECT '\(table)', rowid, id, copied_at, position, payload FROM \(table) WHERE rowid=\(rowID);
+                DELETE FROM \(table) WHERE rowid=\(rowID);
+                """)
+        }
+    }
+    private func readEntries(from table: String, name: String, limit: Int? = nil) throws -> LoadedRows {
+        let stmt = try statement("SELECT id,copied_at,payload,rowid,position FROM \(table) ORDER BY position DESC, rowid ASC")
+        defer { sqlite3_finalize(stmt) }
+        var result = LoadedRows()
+        while true {
+            let step = sqlite3_step(stmt)
+            if step == SQLITE_DONE { break }
+            guard step == SQLITE_ROW else { throw failure("读取\(name)") }
+            if let limit, result.entries.count + result.damaged.count >= limit { throw AppError("\(name)数量异常，原始数据库已保留。") }
+            do {
+                result.entries.append(try decodeEntry(stmt, name: name))
+            } catch {
+                result.damaged.append(sqlite3_column_int64(stmt, 3))
+                if result.firstError == nil { result.firstError = error }
+            }
+        }
+        return result
+    }
+    private func decodeEntry(_ stmt: OpaquePointer, name: String) throws -> Entry {
+        guard sqlite3_column_type(stmt, 0) == SQLITE_TEXT, sqlite3_column_bytes(stmt, 0) == 64,
+              let idText = sqlite3_column_text(stmt, 0) else { throw AppError("\(name)记录标识无效。") }
+        let dateType = sqlite3_column_type(stmt, 1)
+        let timestamp = sqlite3_column_double(stmt, 1)
+        guard (dateType == SQLITE_FLOAT || dateType == SQLITE_INTEGER), timestamp.isFinite,
+              sqlite3_column_type(stmt, 4) == SQLITE_INTEGER, sqlite3_column_int64(stmt, 4) > 0 else {
+            throw AppError("\(name)记录时间或顺序无效。")
+        }
+        let length = Int(sqlite3_column_bytes(stmt, 2))
+        guard sqlite3_column_type(stmt, 2) == SQLITE_BLOB, length > 0, length <= Limits.bytes + 28,
+              let bytes = sqlite3_column_blob(stmt, 2) else { throw AppError("\(name)记录容量或格式无效。") }
+        let data = try AES.GCM.open(AES.GCM.SealedBox(combined: Data(bytes: bytes, count: length)), using: key)
+        let id = String(cString: idText)
+        guard Self.fingerprint(data) == id else { throw AppError("\(name)记录校验失败。") }
+        let payload = try JSONDecoder().decode(Payload.self, from: data)
+        try payload.validate()
+        return Entry(id: id, date: Date(timeIntervalSince1970: timestamp), payload: payload)
+    }
+    static func fingerprint(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+    func save(_ payload: Payload) throws -> Entry {
+        let data = try payload.encoded()
+        let id = Self.fingerprint(data)
+        if let index = entries.firstIndex(where: { $0.id == id }) {
+            return try promoteHistory(at: index)
+        }
+        guard let encrypted = try AES.GCM.seal(data, using: key).combined else { throw AppError("无法生成加密记录。") }
+        let date = Date()
+        try transaction {
+            let stmt = try statement("INSERT INTO history VALUES(?,?,(SELECT COALESCE(MAX(position),0)+1 FROM history),?) ON CONFLICT(id) DO UPDATE SET copied_at=excluded.copied_at,position=excluded.position,payload=excluded.payload")
+            defer { sqlite3_finalize(stmt) }
+            try bind(id, to: stmt, at: 1)
+            guard sqlite3_bind_double(stmt, 2, date.timeIntervalSince1970) == SQLITE_OK else { throw failure("绑定时间") }
+            let bound = encrypted.withUnsafeBytes { sqlite3_bind_blob(stmt, 3, $0.baseAddress, Int32($0.count), transient) }
+            guard bound == SQLITE_OK else { throw failure("绑定内容") }
+            try finish(stmt)
+            try execute("DELETE FROM history WHERE id NOT IN (SELECT id FROM history ORDER BY position DESC LIMIT 50)")
+        }
+        let entry = Entry(id: id, date: date, payload: payload)
+        entries.removeAll { $0.id == id }
+        entries.insert(entry, at: 0)
+        if entries.count > Limits.history { entries.removeLast(entries.count - Limits.history) }
+        return entry
+    }
+    @discardableResult
+    func recordUse(of entry: Entry) throws -> Entry {
+        if let index = entries.firstIndex(where: { $0.id == entry.id }) {
+            return try promoteHistory(at: index)
+        }
+        // 仅在收藏中或刚被淘汰的内容，按普通收录规则重新加入历史。
+        return try save(entry.payload)
+    }
+    private func promoteHistory(at index: Int) throws -> Entry {
+        let stmt = try statement("UPDATE history SET copied_at=?2,position=(SELECT MAX(position)+1 FROM history) WHERE id=?1")
+        defer { sqlite3_finalize(stmt) }
+        var entry = entries[index]
+        entry.date = Date()
+        try bind(entry.id, to: stmt, at: 1)
+        guard sqlite3_bind_double(stmt, 2, entry.date.timeIntervalSince1970) == SQLITE_OK else { throw failure("绑定时间") }
+        try finish(stmt)
+        guard sqlite3_changes(db) == 1 else { throw AppError("历史记录不存在，无法更新复制时间。") }
+        entries.remove(at: index)
+        entries.insert(entry, at: 0)
+        return entry
+    }
+    func delete(_ id: String) throws {
+        let stmt = try statement("DELETE FROM history WHERE id=?")
+        defer { sqlite3_finalize(stmt) }
+        try bind(id, to: stmt, at: 1)
+        try finish(stmt)
+        entries.removeAll { $0.id == id }
+    }
+    func addFavorite(_ id: String) throws {
+        if favorites.contains(where: { $0.id == id }) { return }
+        guard let entry = entries.first(where: { $0.id == id }) else { throw AppError("历史记录不存在，无法收藏。") }
+        // 新收藏使用最低顺位，同顺位按插入顺序显示，旧收藏沿用已有顺位。
+        let stmt = try statement("INSERT INTO favorites(id,copied_at,position,payload) SELECT id,copied_at,1,payload FROM history WHERE id=?")
+        defer { sqlite3_finalize(stmt) }
+        try bind(id, to: stmt, at: 1)
+        try finish(stmt)
+        guard sqlite3_changes(db) == 1 else { throw AppError("历史记录不存在，无法收藏。") }
+        favorites.append(entry)
+    }
+    func moveFavorite(_ id: String, relativeTo neighborID: String, insertAfter: Bool) throws {
+        guard let source = favorites.firstIndex(where: { $0.id == id }),
+              let neighbor = favorites.firstIndex(where: { $0.id == neighborID }) else {
+            throw AppError("拖动的收藏或目标收藏已不存在。")
+        }
+        guard source != neighbor else { return }
+        var destination = neighbor + (insertAfter ? 1 : 0)
+        if source < destination { destination -= 1 }
+        guard source != destination else { return }
+        var reordered = favorites
+        let moved = reordered.remove(at: source)
+        reordered.insert(moved, at: destination)
+        try transaction {
+            let stmt = try statement("UPDATE favorites SET position=?2 WHERE id=?1 AND position<>?2")
+            defer { sqlite3_finalize(stmt) }
+            for (index, entry) in reordered.enumerated() {
+                try bind(entry.id, to: stmt, at: 1)
+                guard sqlite3_bind_int64(stmt, 2, Int64(reordered.count - index)) == SQLITE_OK else {
+                    throw failure("绑定收藏顺序")
+                }
+                try finish(stmt)
+                guard sqlite3_reset(stmt) == SQLITE_OK else { throw failure("重置收藏排序语句") }
+            }
+        }
+        favorites = reordered
+    }
+    func removeFavorite(_ id: String) throws {
+        let stmt = try statement("DELETE FROM favorites WHERE id=?")
+        defer { sqlite3_finalize(stmt) }
+        try bind(id, to: stmt, at: 1)
+        try finish(stmt)
+        guard sqlite3_changes(db) == 1 else { throw AppError("收藏记录不存在，无法取消收藏。") }
+        favorites.removeAll { $0.id == id }
+    }
+    func clear() throws {
+        try execute("DELETE FROM history")
+        entries.removeAll()
+    }
+}

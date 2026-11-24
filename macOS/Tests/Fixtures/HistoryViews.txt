@@ -1,0 +1,384 @@
+import AppKit
+
+enum HistoryLayout {
+    static let width: CGFloat = 460
+    static let height: CGFloat = 620
+    static let textRowHeight: CGFloat = 28
+    static let imageRowHeight: CGFloat = 54
+    static let imageHeight: CGFloat = 42
+    static let cornerRadius: CGFloat = 16
+    static let screenMargin: CGFloat = 8
+    static let cursorGap: CGFloat = 12
+}
+
+final class HistorySurface: NSView {
+    override var allowsVibrancy: Bool { false }
+}
+
+final class HistoryWindow: NSPanel {
+    var keyAction: ((NSEvent) -> Bool)?
+    func installSurface() -> NSView {
+        appearance = NSAppearance(named: .darkAqua)
+        if #available(macOS 26.0, *) {
+            let container = NSView()
+            let glass = NSGlassEffectView()
+            glass.style = .regular
+            glass.cornerRadius = HistoryLayout.cornerRadius
+            let surface = HistorySurface()
+            // 参考 Maccy：玻璃作为背景，正文单独承载，保持文字颜色稳定。
+            for view in [glass, surface] {
+                view.translatesAutoresizingMaskIntoConstraints = false
+                container.addSubview(view)
+                NSLayoutConstraint.activate([
+                    view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                    view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                    view.topAnchor.constraint(equalTo: container.topAnchor),
+                    view.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+                ])
+            }
+            container.wantsLayer = true
+            container.layer?.cornerRadius = HistoryLayout.cornerRadius
+            container.layer?.cornerCurve = .continuous
+            container.layer?.masksToBounds = true
+            contentView = container
+            return surface
+        }
+        let material = NSVisualEffectView()
+        material.material = .popover
+        material.blendingMode = .behindWindow
+        material.state = .active
+        contentView = material
+        applyRoundedCorners()
+        let surface = HistorySurface()
+        surface.translatesAutoresizingMaskIntoConstraints = false
+        material.addSubview(surface)
+        NSLayoutConstraint.activate([
+            surface.leadingAnchor.constraint(equalTo: material.leadingAnchor),
+            surface.trailingAnchor.constraint(equalTo: material.trailingAnchor),
+            surface.topAnchor.constraint(equalTo: material.topAnchor),
+            surface.bottomAnchor.constraint(equalTo: material.bottomAnchor)
+        ])
+        return surface
+    }
+    func applyRoundedCorners() {
+        guard let material = contentView as? NSVisualEffectView else { return }
+        let radius = HistoryLayout.cornerRadius
+        let mask = NSImage(size: NSSize(width: radius * 2 + 1, height: radius * 2 + 1), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+            return true
+        }
+        mask.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
+        mask.resizingMode = .stretch
+        // 材质由窗口合成器绘制，必须使用原生遮罩同步裁切材质与阴影。
+        material.maskImage = mask
+        material.wantsLayer = true
+        material.layer?.cornerRadius = radius
+        material.layer?.cornerCurve = .circular
+        material.layer?.masksToBounds = true
+        invalidateShadow()
+    }
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+    override func sendEvent(_ event: NSEvent) {
+        // 组合输入的确认、取消与候选选择交给当前文本编辑器处理。
+        if event.type == .keyDown, let editor = firstResponder as? NSTextView, editor.hasMarkedText() {
+            super.sendEvent(event)
+            return
+        }
+        if event.type == .keyDown, keyAction?(event) == true { return }
+        super.sendEvent(event)
+    }
+}
+
+final class HistoryTableView: NSTableView {
+    var entryIDAtRow: ((Int) -> String?)?
+    var allowsHoverSelection: () -> Bool = { true }
+    private var pressedRow: (index: Int, entryID: String?)?
+    var draggedSinceMouseDown = false
+    var clickMatchesEntry: Bool {
+        guard !draggedSinceMouseDown else { return false }
+        guard let pressedRow else { return true }
+        return pressedRow.index == clickedRow && pressedRow.entryID != nil && pressedRow.entryID == entryIDAtRow?(clickedRow)
+    }
+    private var hoverTrackingArea: NSTrackingArea?
+    private var scrollObserver: NSObjectProtocol?
+    private var lastScrollEvent: NSEvent?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
+        scrollObserver = nil
+        guard window != nil, let clip = enclosingScrollView?.contentView else { return }
+        clip.postsBoundsChangedNotifications = true
+        scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification, object: clip, queue: nil) { [weak self] _ in
+            guard let self, let event = self.lastScrollEvent,
+                  ProcessInfo.processInfo.systemUptime - event.timestamp < 1,
+                  NSApp.currentEvent?.type != .keyDown else { return }
+            // 滚动动画继续改变可见范围时重新计算，键盘导航不被旧鼠标事件覆盖。
+            self.selectRowUnderPointer(event)
+        }
+    }
+    deinit {
+        if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
+    }
+
+    override func updateTrackingAreas() {
+        if let hoverTrackingArea { removeTrackingArea(hoverTrackingArea) }
+        let area = NSTrackingArea(rect: .zero,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self, userInfo: nil)
+        addTrackingArea(area)
+        hoverTrackingArea = area
+        super.updateTrackingAreas()
+    }
+    override func mouseEntered(with event: NSEvent) { selectRowUnderPointer(event) }
+    override func mouseMoved(with event: NSEvent) {
+        lastScrollEvent = nil
+        selectRowUnderPointer(event)
+    }
+    override func mouseExited(with event: NSEvent) { lastScrollEvent = nil }
+    override func scrollWheel(with event: NSEvent) {
+        lastScrollEvent = event
+        super.scrollWheel(with: event)
+        // 滚动后以当前指针下的记录为准，不触发复制或抢走搜索框焦点。
+        selectRowUnderPointer(event)
+    }
+    private func selectRowUnderPointer(_ event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard isEnabled, allowsHoverSelection(), visibleRect.contains(point) else { return }
+        let row = row(at: point)
+        guard row >= 0, row < numberOfRows, row != selectedRow else { return }
+        selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+    }
+    override func mouseDown(with event: NSEvent) {
+        draggedSinceMouseDown = false
+        let index = row(at: convert(event.locationInWindow, from: nil))
+        pressedRow = (index, entryIDAtRow?(index))
+        defer { pressedRow = nil }
+        super.mouseDown(with: event)
+    }
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let row = row(at: convert(event.locationInWindow, from: nil))
+        guard isEnabled, row >= 0 else { return nil }
+        selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        return super.menu(for: event)
+    }
+    func scrollAnchor() -> (id: String, offset: CGFloat)? {
+        guard visibleRect.minY > 0 else { return nil }
+        let row = row(at: NSPoint(x: visibleRect.midX, y: visibleRect.minY))
+        guard let id = entryIDAtRow?(row) else { return nil }
+        return (id, visibleRect.minY - rect(ofRow: row).minY)
+    }
+}
+
+final class HistoryRowView: NSTableRowView {
+    override var interiorBackgroundStyle: NSView.BackgroundStyle { isSelected ? .emphasized : .normal }
+    override func drawSelection(in dirtyRect: NSRect) {
+        NSColor.controlAccentColor.setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 0), xRadius: 6, yRadius: 6).fill()
+    }
+}
+
+final class FooterButton: NSButton {
+    private static let hoverFill = NSColor(srgbRed: 0.24, green: 0.24, blue: 0.24, alpha: 0.72)
+    private static let pressedFill = NSColor(srgbRed: 0.16, green: 0.16, blue: 0.16, alpha: 0.86)
+    private let shortcut: String
+    private var hoverArea: NSTrackingArea?
+    private var pointerInside = false {
+        didSet { if pointerInside != oldValue { needsDisplay = true } }
+    }
+
+    init(title: String, shortcut: String = "", target: AnyObject, action: Selector) {
+        self.shortcut = shortcut
+        super.init(frame: .zero)
+        self.title = title
+        self.target = target
+        self.action = action
+        isBordered = false
+        font = .systemFont(ofSize: 13)
+        heightAnchor.constraint(equalToConstant: 26).isActive = true
+        if !shortcut.isEmpty { setAccessibilityHelp("快捷键 \(shortcut)") }
+    }
+
+    required init?(coder: NSCoder) { fatalError("不支持从归档创建底部按钮。") }
+
+    override var isEnabled: Bool {
+        didSet {
+            if isEnabled != oldValue { window?.invalidateCursorRects(for: self) }
+        }
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if isEnabled { addCursorRect(bounds.intersection(visibleRect), cursor: .pointingHand) }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow],
+            owner: self, userInfo: nil)
+        addTrackingArea(area)
+        hoverArea = area
+        pointerInside = window.map { $0.isKeyWindow && bounds.contains(convert($0.mouseLocationOutsideOfEventStream, from: nil)) } ?? false
+    }
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        if event.trackingArea === hoverArea { pointerInside = bounds.contains(convert(event.locationInWindow, from: nil)) }
+    }
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        if event.trackingArea === hoverArea { pointerInside = false }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let highlighted = isEnabled && (pointerInside || isHighlighted)
+        if highlighted {
+            let shape = NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 0.5), xRadius: 6, yRadius: 6)
+            (isHighlighted ? Self.pressedFill : Self.hoverFill).setFill()
+            shape.fill()
+            NSColor.separatorColor.setStroke()
+            shape.lineWidth = 1 / (window?.backingScaleFactor ?? 1)
+            shape.stroke()
+        }
+        func drawLabel(_ string: String, color: NSColor, trailing: Bool) {
+            let text = NSAttributedString(string: string, attributes: [
+                .font: font ?? NSFont.systemFont(ofSize: 13),
+                .foregroundColor: color
+            ])
+            let size = text.size()
+            let x = trailing ? bounds.maxX - 10 - size.width : bounds.minX + 10
+            text.draw(at: NSPoint(x: x, y: bounds.midY - size.height / 2))
+        }
+        let titleColor: NSColor = isEnabled ? .labelColor : .disabledControlTextColor
+        let keyColor: NSColor = isEnabled ? .secondaryLabelColor : .disabledControlTextColor
+        drawLabel(title, color: titleColor, trailing: false)
+        drawLabel(shortcut, color: highlighted ? .labelColor : keyColor, trailing: true)
+    }
+}
+
+final class HistoryCell: NSTableCellView {
+    static let reuseIdentifier = NSUserInterfaceItemIdentifier("history-cell")
+    private let label = NSTextField(labelWithString: "")
+    private let thumbnail = NSImageView()
+    private let favoriteIndicator = NSTextField(labelWithString: "★")
+    private let shortcut = NSTextField(labelWithString: "")
+    private var thumbnailWidth: NSLayoutConstraint!
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        identifier = Self.reuseIdentifier
+        label.font = .systemFont(ofSize: 14)
+        label.lineBreakMode = .byTruncatingMiddle
+        label.maximumNumberOfLines = 1
+        label.cell?.usesSingleLineMode = true
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        favoriteIndicator.font = .systemFont(ofSize: 12)
+        favoriteIndicator.alignment = .center
+        favoriteIndicator.setAccessibilityElement(false)
+        shortcut.font = .systemFont(ofSize: 13, weight: .medium)
+        shortcut.alignment = .right
+        thumbnail.imageScaling = .scaleProportionallyDown
+        thumbnail.imageAlignment = .alignLeft
+        for view in [label, thumbnail, favoriteIndicator, shortcut] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(view)
+        }
+        thumbnailWidth = thumbnail.widthAnchor.constraint(equalToConstant: 180)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            label.trailingAnchor.constraint(equalTo: favoriteIndicator.leadingAnchor, constant: -6),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            thumbnail.leadingAnchor.constraint(equalTo: label.leadingAnchor),
+            thumbnail.centerYAnchor.constraint(equalTo: centerYAnchor),
+            thumbnail.heightAnchor.constraint(equalToConstant: HistoryLayout.imageHeight),
+            thumbnailWidth,
+            thumbnail.trailingAnchor.constraint(lessThanOrEqualTo: favoriteIndicator.leadingAnchor, constant: -6),
+            favoriteIndicator.trailingAnchor.constraint(equalTo: shortcut.leadingAnchor, constant: -4),
+            favoriteIndicator.centerYAnchor.constraint(equalTo: centerYAnchor),
+            favoriteIndicator.widthAnchor.constraint(equalToConstant: 16),
+            shortcut.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            shortcut.centerYAnchor.constraint(equalTo: centerYAnchor),
+            shortcut.widthAnchor.constraint(equalToConstant: 40)
+        ])
+        textField = label
+    }
+    required init?(coder: NSCoder) { fatalError("不支持从归档创建历史行。") }
+    override var backgroundStyle: NSView.BackgroundStyle {
+        didSet {
+            label.textColor = backgroundStyle == .emphasized ? .white : .labelColor
+            favoriteIndicator.textColor = backgroundStyle == .emphasized ? NSColor.white.withAlphaComponent(0.85) : .secondaryLabelColor
+            shortcut.textColor = backgroundStyle == .emphasized ? NSColor.white.withAlphaComponent(0.75) : .secondaryLabelColor
+        }
+    }
+    func configure(entry: Entry, row: Int, image: NSImage?, isFavorite: Bool, numberShortcut: HistoryShortcut) {
+        label.stringValue = entry.preview
+        label.isHidden = image != nil
+        thumbnail.image = image
+        thumbnail.isHidden = image == nil
+        if let image {
+            thumbnailWidth.constant = min(200, max(1, HistoryLayout.imageHeight * image.size.width / max(1, image.size.height)))
+        }
+        shortcut.stringValue = numberShortcut.label(for: row)
+        favoriteIndicator.isHidden = !isFavorite
+        favoriteIndicator.textColor = backgroundStyle == .emphasized ? NSColor.white.withAlphaComponent(0.85) : .secondaryLabelColor
+        shortcut.textColor = backgroundStyle == .emphasized ? NSColor.white.withAlphaComponent(0.75) : .secondaryLabelColor
+        let date = DateFormatter.localizedString(from: entry.date, dateStyle: .short, timeStyle: .short)
+        toolTip = "\(entry.payload.label) · \(date)\(isFavorite ? " · 已收藏" : "")"
+        setAccessibilityLabel("\(entry.payload.label)：\(entry.preview)\(isFavorite ? "，已收藏" : "")")
+    }
+}
+
+final class ContentPreviewController: NSViewController {
+    init(entry: Entry, image: NSImage?) {
+        super.init(nibName: nil, bundle: nil)
+        preferredContentSize = NSSize(width: 360, height: image == nil ? 300 : 340)
+        let root = NSView(frame: NSRect(origin: .zero, size: preferredContentSize))
+        view = root
+        let payload = entry.payload
+        let kind = payload.kind == .image ? "图片 · \(payload.width) × \(payload.height) 像素" : payload.label
+        let heading = NSTextField(labelWithString: "\(kind) · \(DateFormatter.localizedString(from: entry.date, dateStyle: .short, timeStyle: .short))")
+        heading.font = .systemFont(ofSize: 11)
+        heading.textColor = .secondaryLabelColor
+        heading.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(heading)
+        let content: NSView
+        if let image {
+            let imageView = NSImageView()
+            imageView.image = image
+            imageView.imageScaling = .scaleProportionallyDown
+            content = imageView
+        } else {
+            let scroll = NSScrollView()
+            scroll.hasVerticalScroller = true
+            scroll.drawsBackground = false
+            let text = NSTextView(frame: NSRect(x: 0, y: 0, width: 328, height: 252))
+            text.isEditable = false
+            text.isSelectable = true
+            text.drawsBackground = false
+            text.font = .systemFont(ofSize: 13)
+            text.textColor = .labelColor
+            text.isVerticallyResizable = true
+            text.isHorizontallyResizable = false
+            text.autoresizingMask = [.width]
+            text.textContainer?.widthTracksTextView = true
+            text.textContainer?.containerSize = NSSize(width: 328, height: CGFloat.greatestFiniteMagnitude)
+            text.string = entry.payload.detail
+            scroll.documentView = text
+            content = scroll
+        }
+        content.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(content)
+        NSLayoutConstraint.activate([
+            heading.topAnchor.constraint(equalTo: root.topAnchor, constant: 14),
+            heading.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+            heading.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+            content.topAnchor.constraint(equalTo: heading.bottomAnchor, constant: 10),
+            content.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
+            content.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
+            content.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError("不支持从归档创建预览。") }
+}

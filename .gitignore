@@ -1,0 +1,6 @@
+.work/
+.build/
+.swiftpm/
+artifacts/
+.idea/
+.DS_Store

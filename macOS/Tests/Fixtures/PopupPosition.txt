@@ -1,0 +1,59 @@
+import AppKit
+
+enum PopupPosition: String, CaseIterable {
+    case cursor, center, statusItem
+
+    static let preferenceKey = "popupPosition"
+
+    static func saved(in defaults: UserDefaults) -> Self {
+        defaults.string(forKey: preferenceKey).flatMap(Self.init(rawValue:)) ?? .center
+    }
+
+    func makePicker(target: AnyObject, action: Selector) -> NSPopUpButton {
+        let picker = NSPopUpButton(frame: .zero, pullsDown: false)
+        for position in Self.allCases {
+            picker.addItem(withTitle: position.title)
+            picker.lastItem?.representedObject = position.rawValue
+        }
+        picker.selectItem(withTitle: title)
+        picker.setAccessibilityLabel("窗口显示位置")
+        picker.target = target
+        picker.action = action
+        return picker
+    }
+
+    var title: String {
+        switch self {
+        case .cursor: return "鼠标附近"
+        case .center: return "屏幕中央"
+        case .statusItem: return "菜单栏旁"
+        }
+    }
+
+    func frame(size: NSSize, visibleFrame: NSRect, cursor: NSPoint, statusFrame: NSRect?, aboveCursor: Bool? = nil) -> NSRect {
+        let available = visibleFrame.insetBy(dx: HistoryLayout.screenMargin, dy: HistoryLayout.screenMargin)
+        var size = NSSize(width: min(size.width, available.width), height: min(size.height, available.height))
+        var origin: NSPoint
+        switch self {
+        case .center:
+            origin = NSPoint(x: available.midX - size.width / 2, y: available.midY - size.height / 2)
+        case .statusItem:
+            if let statusFrame {
+                origin = NSPoint(x: statusFrame.maxX - size.width, y: statusFrame.minY - size.height - 6)
+            } else {
+                return PopupPosition.cursor.frame(size: size, visibleFrame: visibleFrame, cursor: cursor, statusFrame: nil, aboveCursor: aboveCursor)
+            }
+        case .cursor:
+            let cursorY = min(max(cursor.y, available.minY), available.maxY)
+            let below = max(0, cursorY - HistoryLayout.cursorGap - available.minY)
+            let above = max(0, available.maxY - cursorY - HistoryLayout.cursorGap)
+            let useAbove = aboveCursor ?? (below < size.height && above > below)
+            // 单侧空间不足时缩短列表并滚动，不跨过鼠标覆盖输入区域。
+            size.height = min(size.height, useAbove ? above : below)
+            origin = NSPoint(x: cursor.x, y: useAbove ? cursorY + HistoryLayout.cursorGap : cursorY - HistoryLayout.cursorGap - size.height)
+        }
+        origin.x = max(available.minX, min(origin.x, available.maxX - size.width))
+        origin.y = max(available.minY, min(origin.y, available.maxY - size.height))
+        return NSRect(origin: origin, size: size)
+    }
+}
