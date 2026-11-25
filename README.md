@@ -23,6 +23,22 @@
 - 若 [Releases](https://github.com/MongoRolls/clipnest/releases) 的 Assets 提供 `ClipNest-macOS-universal.zip`，下载解压后，将 `ClipNest.app` 拖入「应用程序」。
 - 如果只看到 GitHub 自动生成的 **Source code**，那是源码，不是安装包。可按下方步骤本地构建。签名和公证说明见 [分发指南](docs/DISTRIBUTION.md)。
 
+### 首次打开被 macOS 拦截
+
+仅在确认 `ClipNest.app` 来自可信来源（如你自己构建，或你已核对下载来源）时使用。若确认是下载隔离标记导致的拦截，可在「终端」中仅移除该标记：
+
+```sh
+xattr -dr com.apple.quarantine /Applications/ClipNest.app
+```
+
+也可以执行以下命令，但它会递归清除应用包内的**所有扩展属性**，不只是隔离标记：
+
+```sh
+xattr -cr /Applications/ClipNest.app
+```
+
+执行后再打开应用。这不等同于签名或公证；如果仍无法打开，请核对下载来源，不要关闭系统安全检查。
+
 ## 快速上手
 
 启动 ClipNest 后，复制一段文字，再按 `⌘⇧V` 或从菜单栏选择「显示历史」。输入关键词，选中记录后按回车。
